@@ -1,0 +1,370 @@
+// ============================================================
+//  Rescue Robot - Line Follower ESP32 (Core v4.x.x Turbo)
+//  ภารกิจ: สำรวจหา A,B,C -> กลับ(H) -> ส่ง A, B, C -> กลับ(H) จบภารกิจ
+//  อัปเดตระบบ: PD Control เพื่อความ Smooth ตอนเร่งความเร็ว
+// ============================================================
+
+#include <Arduino.h>
+
+#define DEBUG_MODE 1  
+
+// ─── PIN DEFINITIONS (ESP32) ────────────────────────────────
+#define PIN_LED_A 26
+#define PIN_LED_B 27
+#define PIN_LED_C 14
+
+#define SENSOR_L  25
+#define SENSOR_ML 33
+#define SENSOR_M  32
+#define SENSOR_MR 35
+#define SENSOR_R  34
+
+#define MOTOR_L_FWD 5
+#define MOTOR_L_BWD 18
+#define MOTOR_R_FWD 19
+#define MOTOR_R_BWD 21
+
+const int PWM_FREQ = 5000;
+const int PWM_RES = 8;
+
+// ─── GLOBAL VARIABLES ───────────────────────────────────────
+String pathMemory = "H"; 
+String playPathMemory = "";
+
+char Here = 'H';           
+char expectedTarget = ' '; 
+bool isExecutingPath = false;
+int returnPathIndex = 0;
+
+struct SensorData {
+  int sL; int sML; int sM; int sMR; int sR;
+};
+
+// ============================================================
+//  CONFIGURATIONS & SPEED CONTROL
+// ============================================================
+#define SPEED_NORMAL 150  // ความเร็วตอนสำรวจ (เดินเนิบๆ ชัวร์ๆ)
+#define SPEED_FAST   210  // ความเร็วตอนส่งของ (ซิ่งทะลุจอ!)
+#define SPEED_SLOW   100  
+#define SPEED_TURN   140  
+#define TURN_TIME_90 850
+#define TURN_TIME_180 2200
+#define CHECKPOINT_WAIT 1500
+
+#define HW_BLACK 0
+#define HW_WHITE 1
+
+// ตัวแปรสำหรับ PD Control และการควบคุมความเร็ว
+int baseSpeed = SPEED_NORMAL;
+float Kp = 30.0;
+float Kd = 10.0; 
+int lastError = 0;
+
+enum RobotState {
+  STATE_EXPLORE,
+  STATE_GOTO_HOME,       // กลับบ้านรอบแรกเพื่อเริ่มส่งของ
+  STATE_GOTO_A,
+  STATE_GOTO_B,
+  STATE_GOTO_C,
+  STATE_RETURN_HOME_FINAL, // ส่งของเสร็จ กลับบ้านเพื่อจบเกม
+  STATE_DONE
+};
+
+RobotState robotState = STATE_EXPLORE;
+bool foundA = false, foundB = false, foundC = false;
+
+// ============================================================
+//  MOTOR PRIMITIVES
+// ============================================================
+void motorStop() {
+  ledcWrite(MOTOR_L_FWD, 0); ledcWrite(MOTOR_L_BWD, 0);
+  ledcWrite(MOTOR_R_FWD, 0); ledcWrite(MOTOR_R_BWD, 0);
+}
+
+void motorForward(int spd = baseSpeed) {
+  ledcWrite(MOTOR_L_FWD, spd); ledcWrite(MOTOR_L_BWD, 0);
+  ledcWrite(MOTOR_R_FWD, spd); ledcWrite(MOTOR_R_BWD, 0);
+}
+
+void motorTurnLeft(int spd = SPEED_TURN) {
+  ledcWrite(MOTOR_L_FWD, 0);   ledcWrite(MOTOR_L_BWD, 0);
+  ledcWrite(MOTOR_R_FWD, spd); ledcWrite(MOTOR_R_BWD, 0);
+}
+
+void motorTurnRight(int spd = SPEED_TURN) {
+  ledcWrite(MOTOR_L_FWD, spd); ledcWrite(MOTOR_L_BWD, 0);
+  ledcWrite(MOTOR_R_FWD, 0);   ledcWrite(MOTOR_R_BWD, 0);
+}
+
+void motorSpinLeft(int spd = SPEED_TURN) {
+  ledcWrite(MOTOR_L_FWD, 0);   ledcWrite(MOTOR_L_BWD, spd);
+  ledcWrite(MOTOR_R_FWD, spd); ledcWrite(MOTOR_R_BWD, 0);
+}
+
+void motorSpinRight(int spd = SPEED_TURN) {
+  ledcWrite(MOTOR_L_FWD, spd); ledcWrite(MOTOR_L_BWD, 0);
+  ledcWrite(MOTOR_R_FWD, 0);   ledcWrite(MOTOR_R_BWD, spd);
+}
+
+// ============================================================
+//  READ SENSORS
+// ============================================================
+SensorData readSensors() {
+  SensorData d;
+  d.sL = (digitalRead(SENSOR_L) == HW_BLACK) ? 1 : 0;
+  d.sML = (digitalRead(SENSOR_ML) == HW_BLACK) ? 1 : 0;
+  d.sM = (digitalRead(SENSOR_M) == HW_BLACK) ? 1 : 0;
+  d.sMR = (digitalRead(SENSOR_MR) == HW_BLACK) ? 1 : 0;
+  d.sR = (digitalRead(SENSOR_R) == HW_BLACK) ? 1 : 0;
+  return d;
+}
+
+void RecordPath(char P) {
+  pathMemory += P;
+  if (DEBUG_MODE) { Serial.print("RecordPath: "); Serial.println(pathMemory); }
+}
+
+// ============================================================
+//  LINE FOLLOW (อัปเกรดเป็น PD Controller)
+// ============================================================
+char followLineUntilEvent() {
+  while (true) {
+    SensorData s = readSensors();
+    int total = s.sL + s.sML + s.sM + s.sMR + s.sR;
+
+    if (total >= 4) {
+      motorStop();
+      if (DEBUG_MODE) Serial.println("Event: Junction Detected (J)");
+      return 'J';
+    }
+
+    if (total == 0) {
+      delay(50);
+      if (readSensors().sM == 0) {
+        motorStop();
+        if (DEBUG_MODE) Serial.println("Event: End/Checkpoint Detected (E)");
+        return 'E';
+      }
+    }
+
+    // คำนวณ Error (หาจุดศูนย์กลางเส้น)
+    int error = (-4 * s.sL) + (-2 * s.sML) + (0 * s.sM) + (2 * s.sMR) + (4 * s.sR);
+    
+    // 🌟 PD Control Algorithm 
+    int P = error;
+    int D = error - lastError;
+    lastError = error;
+
+    int turnVal = (P * Kp) + (D * Kd); // รวมแรงเลี้ยว + แรงต้านการส่าย
+
+    int leftSpd = constrain(baseSpeed + turnVal, 0, 255);
+    int rightSpd = constrain(baseSpeed - turnVal, 0, 255);
+
+    ledcWrite(MOTOR_L_FWD, leftSpd); ledcWrite(MOTOR_L_BWD, 0);
+    ledcWrite(MOTOR_R_FWD, rightSpd); ledcWrite(MOTOR_R_BWD, 0);
+  }
+}
+
+// ============================================================
+//  EVENTS & CHECKPOINTS
+// ============================================================
+void handleJunction() {
+  motorForward(SPEED_SLOW); delay(150); motorStop();
+  motorSpinLeft(); delay(TURN_TIME_90); motorStop();
+  RecordPath('L');
+}
+
+char readCheckpoint() {
+  motorForward(SPEED_SLOW); delay(150); motorStop(); delay(50);
+  SensorData s = readSensors();
+  if (s.sL == 1 && s.sML == 1 && s.sM == 0 && s.sMR == 1 && s.sR == 1) return 'C';
+  else if (s.sR == 1 || s.sMR == 1) return 'A';
+  else if (s.sL == 1 || s.sML == 1) return 'B';
+  return 'U';
+}
+
+void doUTurn() {
+  motorSpinLeft(); delay(TURN_TIME_180); motorStop();
+}
+
+void exploreStep() {
+  char ev = followLineUntilEvent();
+
+  if (ev == 'J') {
+    handleJunction();
+    return;
+  }
+
+  if (ev == 'E') {
+    char cp = readCheckpoint();
+
+    if (cp == 'A' || cp == 'B' || cp == 'C') {
+      if (cp == 'A' && !foundA) { foundA = true; RecordPath('A'); digitalWrite(PIN_LED_A, HIGH); delay(CHECKPOINT_WAIT); }
+      else if (cp == 'B' && !foundB) { foundB = true; RecordPath('B'); digitalWrite(PIN_LED_B, HIGH); delay(CHECKPOINT_WAIT); }
+      else if (cp == 'C' && !foundC) { foundC = true; RecordPath('C'); digitalWrite(PIN_LED_C, HIGH); delay(CHECKPOINT_WAIT); }
+      else { RecordPath(cp); } 
+    }
+
+    doUTurn();
+    RecordPath('U'); 
+
+    if (foundA && foundB && foundC) {
+      Here = cp; 
+      robotState = STATE_GOTO_HOME; 
+    }
+  }
+}
+
+// ============================================================
+//  GPS ROUTING 
+// ============================================================
+void prepareGoTo(char targetNode) {
+  if (Here == targetNode) return;
+
+  int a = pathMemory.indexOf(Here);
+  int b = pathMemory.indexOf(targetNode);
+  String mem = "";
+
+  if (a < 0 || b < 0) return; 
+
+  if (a < b) { 
+    for (int i = 0; i <= (b - a); i++) mem += pathMemory[a + i];
+  } else if (a > b) { 
+    for (int i = 0; i <= (a - b); i++) {
+      char c = pathMemory[a - i];
+      if (c == 'L') c = 'R';
+      else if (c == 'R') c = 'L';
+      mem += c;
+    }
+  }
+
+  if (a < b && mem.length() >= 2 && mem[1] == 'U') mem.remove(1, 1);
+  else if (a > b && mem.length() >= 2 && mem[mem.length() - 2] == 'U') mem.remove(mem.length() - 2, 1);
+
+  for (int i = 1; i < mem.length() - 1; i++) {
+    char c = mem[i];
+    if (c == 'A' || c == 'B' || c == 'C' || c == 'H') {
+      mem.remove(i, 1);
+      i--;
+    }
+  }
+
+  bool changed = true;
+  while (changed) {
+    int prevLen = mem.length();
+    mem.replace("LUR", "U"); mem.replace("RUL", "U");
+    mem.replace("LUF", "R"); mem.replace("RUF", "L");
+    mem.replace("FUL", "R"); mem.replace("FUR", "L");
+    mem.replace("LUL", "F"); mem.replace("RUR", "F");
+    mem.replace("FUF", "U");
+    if (mem.length() == prevLen) changed = false;
+  }
+
+  playPathMemory = mem;
+  returnPathIndex = 1; 
+  expectedTarget = targetNode;
+  isExecutingPath = true;
+
+  if (DEBUG_MODE) { Serial.print("Optimized GPS Route: "); Serial.println(playPathMemory); }
+}
+
+// ============================================================
+//  EXECUTE PATH 
+// ============================================================
+void executeReturnCommand(char cmd) {
+  motorForward(SPEED_SLOW); delay(150); motorStop(); 
+
+  if (cmd == 'L') { motorSpinLeft(); delay(TURN_TIME_90); motorStop(); }
+  else if (cmd == 'R') { motorSpinRight(); delay(TURN_TIME_90); motorStop(); }
+  else if (cmd == 'F') { motorForward(baseSpeed); delay(300); motorStop(); } // เลี้ยว F พุ่งด้วย BaseSpeed
+  else if (cmd == 'U') { motorSpinLeft(); delay(TURN_TIME_180); motorStop(); }
+}
+
+// ============================================================
+//  MAIN SETUP & LOOP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_LED_A, OUTPUT); pinMode(PIN_LED_B, OUTPUT); pinMode(PIN_LED_C, OUTPUT);
+  pinMode(SENSOR_L, INPUT); pinMode(SENSOR_ML, INPUT); pinMode(SENSOR_M, INPUT); pinMode(SENSOR_MR, INPUT); pinMode(SENSOR_R, INPUT);
+
+  ledcAttach(MOTOR_L_FWD, PWM_FREQ, PWM_RES); ledcAttach(MOTOR_L_BWD, PWM_FREQ, PWM_RES);
+  ledcAttach(MOTOR_R_FWD, PWM_FREQ, PWM_RES); ledcAttach(MOTOR_R_BWD, PWM_FREQ, PWM_RES);
+
+  if (DEBUG_MODE) Serial.println("=== Robot Ready! Wait 2s ===");
+  delay(2000);
+}
+
+void loop() {
+  if (isExecutingPath) {
+    char ev = followLineUntilEvent();
+    char cmd = playPathMemory[returnPathIndex];
+
+    if (cmd == expectedTarget) {
+      motorForward(SPEED_SLOW); delay(150); motorStop();
+      
+      if (expectedTarget == 'A') { digitalWrite(PIN_LED_A, LOW); delay(CHECKPOINT_WAIT); }
+      else if (expectedTarget == 'B') { digitalWrite(PIN_LED_B, LOW); delay(CHECKPOINT_WAIT); }
+      else if (expectedTarget == 'C') { digitalWrite(PIN_LED_C, LOW); delay(CHECKPOINT_WAIT); }
+      else if (expectedTarget == 'H') { delay(1000); }
+
+      doUTurn(); 
+      Here = expectedTarget; 
+      isExecutingPath = false; 
+    } 
+    else {
+      if (ev == 'J' || ev == 'E') {
+        executeReturnCommand(cmd);
+        returnPathIndex++;
+      }
+    }
+    return; 
+  }
+
+  // 🌟 State Machine หลัก (สลับความเร็วเมื่อส่งของ)
+  switch (robotState) {
+    case STATE_EXPLORE:
+      baseSpeed = SPEED_NORMAL; // สำรวจ: ช้าๆ ชัวร์ๆ
+      exploreStep();
+      break;
+
+    case STATE_GOTO_HOME:
+      // 🚀 เข้าสู่โหมดซิ่ง! ปรับความเร็วและเพิ่มแรงเกาะเส้น
+      baseSpeed = SPEED_FAST; 
+      Kp = 35.0; Kd = 40.0; // เพิ่ม D (Kd) เข้าไปดึงหุ่นไม่ให้ส่ายตอนวิ่งเร็ว
+      
+      prepareGoTo('H');
+      robotState = STATE_GOTO_A; 
+      break;
+
+    case STATE_GOTO_A:
+      prepareGoTo('A');
+      robotState = STATE_GOTO_B; 
+      break;
+
+    case STATE_GOTO_B:
+      prepareGoTo('B');
+      robotState = STATE_GOTO_C; 
+      break;
+
+    case STATE_GOTO_C:
+      prepareGoTo('C');
+      robotState = STATE_RETURN_HOME_FINAL; // 🌟 ส่ง C เสร็จ ให้สลับไปกลับบ้าน!
+      break;
+
+    case STATE_RETURN_HOME_FINAL:
+      prepareGoTo('H'); // คำนวณเส้นทางจาก C กลับ H
+      robotState = STATE_DONE;
+      break;
+
+    case STATE_DONE:
+      motorStop();
+      if (DEBUG_MODE) Serial.println("✅ MISSION ACCOMPLISHED!");
+      digitalWrite(PIN_LED_A, HIGH); digitalWrite(PIN_LED_B, HIGH); digitalWrite(PIN_LED_C, HIGH);
+      delay(500);
+      digitalWrite(PIN_LED_A, LOW); digitalWrite(PIN_LED_B, LOW); digitalWrite(PIN_LED_C, LOW);
+      delay(500);
+      break;
+  }
+}
